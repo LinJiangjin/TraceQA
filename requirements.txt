@@ -1,0 +1,15 @@
+fastapi>=0.115
+uvicorn[standard]>=0.32
+sqlalchemy>=2.0
+psycopg[binary,pool]>=3.2
+alembic>=1.14
+pgvector>=0.3
+pydantic>=2.9
+pydantic-settings>=2.6
+litellm>=1.50
+pyjwt>=2.10
+pyyaml>=6.0
+pypdf>=5.1
+opentelemetry-sdk>=1.28
+opentelemetry-api>=1.28
+opentelemetry-exporter-otlp-proto-http>=1.28

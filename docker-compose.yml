@@ -1,0 +1,82 @@
+services:
+  db:
+    # 镜像地址全部变量化：默认走官方源（客户环境/海外），
+    # 大陆网络在 .env 里覆盖成镜像站前缀即可，不用改这个文件。
+    image: ${DB_IMAGE:-pgvector/pgvector:pg16}
+    environment:
+      POSTGRES_USER: tracingqa
+      POSTGRES_PASSWORD: tracingqa
+      POSTGRES_DB: tracingqa
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tracingqa -d tracingqa"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # 本地 embedding 服务。客户环境禁止出网时，模型必须本地部署，
+  # 所以从第一天就按离线可达的方式设计。
+  # 一个 TEI 实例只能加载一个模型，所以 embedding 和 rerank 各起一个。
+  embedder:
+    image: ${TEI_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.6}
+    command: --model-id ${EMBEDDING_MODEL:-BAAI/bge-m3}
+    # 权重下载有坑：TEI 的下载器要求响应带 Content-Range，而 hf-mirror 的重定向会丢掉它，
+    # 结果是 "Error: Could not download model artifacts / Header content-range is missing" 直接退出。
+    # 所以大陆网络下的做法是：宿主机用 `hf download` 下到 ./.models，再挂进来用本地路径，
+    # 让 TEI 完全不碰下载逻辑。能直连 HF 的环境把 EMBEDDING_MODEL 换回模型名即可。
+    environment:
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+      HF_HUB_DISABLE_XET: "1"
+    ports:
+      - "9997:80"
+    volumes:
+      - embedder_cache:/data
+      - ./.models:/models:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+
+  # reranker 必须单独一个实例，端口与 embedder 分开（见 .env 的 RERANK_ENDPOINT）。
+  reranker:
+    image: ${TEI_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.6}
+    command: --model-id ${RERANK_MODEL:-BAAI/bge-reranker-v2-m3}
+    environment:
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+      HF_HUB_DISABLE_XET: "1"
+    ports:
+      - "9998:80"
+    volumes:
+      - reranker_cache:/data
+      - ./.models:/models:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+
+  api:
+    build: .
+    env_file: .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      embedder:
+        condition: service_healthy
+      # 只等"启动"，不等"就绪"：bge-reranker-v2-m3 首次要下 2GB+ 权重，
+      # 等它会把整个 compose 卡住。没就绪时 rerank 自动降级到融合检索分，
+      # 日志里会打印 [rerank] 远端 reranker 不可用，权重下完自动生效。
+      reranker:
+        condition: service_started
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  pgdata:
+  embedder_cache:
+  reranker_cache:

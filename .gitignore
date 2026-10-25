@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.pytest_cache/
+.evalcache/
+
+# 本地模型权重（bge-m3 / bge-reranker-v2-m3，各 2.2GB，绝不进版本库）
+.models/
+.model_test/

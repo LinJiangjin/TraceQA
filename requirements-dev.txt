@@ -1,0 +1,3 @@
+# 开发/测试依赖。运行时依赖在 requirements.txt，Dockerfile 只装后者。
+-r requirements.txt
+pytest>=8.3

@@ -1,0 +1,48 @@
+name: CI
+
+# 关键：eval 作为合并门禁。指标跌了就别合进去 —— 这是 FDE 质量保证工程化的体现。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: tracingqa
+          POSTGRES_PASSWORD: tracingqa
+          POSTGRES_DB: tracingqa
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5432:5432
+    env:
+      DATABASE_URL: postgresql+psycopg://tracingqa:tracingqa@localhost:5432/tracingqa
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Init db
+        run: python -c "from app.db import init_db; init_db()"
+
+      - name: Run unit tests
+        run: pytest -q tests/
+
+      - name: Run evals (gate)
+        run: python -m evals.harness --dataset evals/dataset.yaml --variant ci-${{ github.sha }} --fail-under-recall 0.85 --max-leakage 0.0
