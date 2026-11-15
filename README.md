@@ -35,6 +35,11 @@ docker compose up -d          # Postgres(pgvector) + embedder(bge-m3) + reranker
 curl http://localhost:8000/healthz
 ```
 
+> Windows PowerShell：`cp` 可以直接用（`Copy-Item` 的别名），也可写成
+> `Copy-Item .env.example .env`。但 **`curl` 不能直接用**：它是 `Invoke-WebRequest`
+> 的别名，参数与 curl 不兼容，请写成 `curl.exe` 或改用 `Invoke-RestMethod`。
+> 本文后续所有 `curl` 命令同理。
+
 首次要拉 3GB+ 权重（bge-m3 ~1.2GB、bge-reranker-v2-m3 ~2.2GB），
 `docker compose logs -f reranker` 看到 ready 后精排才真正生效（没 ready 时会自动降级，不影响启动）。
 
@@ -46,7 +51,7 @@ curl http://localhost:8000/healthz
 docker compose up -d db embedder reranker
 ```
 
-然后**必须覆盖两个服务名**（`.env` 里写的是 compose 服务名，本机连不上）：
+然后**必须覆盖三个地址**（`.env` 里写的是 compose 内网服务名 `db` / `embedder` / `reranker`，本机解析不了）：
 
 ```powershell
 $env:DATABASE_URL="postgresql+psycopg://tracingqa:tracingqa@localhost:5432/tracingqa"
@@ -56,6 +61,10 @@ $env:RERANK_ENDPOINT="http://localhost:9998"
 ```
 
 Git Bash 用 `export KEY=value` 三行替代上面三行。
+
+> `$env:` 只在**当前 PowerShell 窗口**有效：灌文档、跑评测等新开的终端都要重新设置。
+> 反过来，方式 A 里 API 跑在容器中，用 `.env` 的 `db:5432` 才是对的，不要覆盖。
+> 两种方式二选一，同时运行会抢 8000 端口。
 
 ### 方式 C：只起数据库（网络差时先跑通链路）
 
@@ -88,6 +97,17 @@ curl http://localhost:9998/health                                    # 4. rerank
 > `--acl` 指的是「哪些角色能看到」，不是「哪些角色被限制」。
 > 写成 `--acl employee,hr` 等于给所有员工开权限，越权测试就失去意义了。
 
+> **灌库不是幂等的**：同一条命令执行两次会插入两份 `documents` / `chunks`，
+> 造成召回结果重复、挤占 top-k、引用变冗余。可用
+> `SELECT title, acl FROM documents;` 检查（正常应为 3 行 documents / 12 个 chunks），
+> 发现重复就清空这两张表再灌一次（`qa_logs` 审计记录会保留）：
+>
+> ```sql
+> TRUNCATE TABLE chunks, documents;
+> ```
+>
+> 重灌后历史 `qa_logs` 里的 `retrieved_chunk_ids` 会指向已删除的 chunk，只是留痕，不影响演示。
+
 查询：
 
 ```bash
@@ -103,8 +123,9 @@ curl -s http://localhost:8000/api/v1/qa \
 ./.venv/Scripts/python.exe -m evals.harness --dataset evals/dataset.yaml --variant v1-baseline
 ```
 
-> `.env` 里 `LLM_API_KEY` 是空的，灌文档和检索都能跑，只有最后一步生成答案会失败。
-> 填一个 DeepSeek / OpenAI 的 key 再重启即可。
+> `.env.example` 里 `LLM_API_KEY` 默认为空：灌文档和检索都能跑，只有最后一步生成答案会失败。
+> 填一个 DeepSeek / OpenAI 的 key 再重启即可（用 DeepSeek 时同时设
+> `LLM_BASE_URL=https://api.deepseek.com`）。改完要**重启 API**，配置只在进程启动时读取。
 
 ### 本地模型（大陆网络必看）
 
@@ -132,15 +153,60 @@ export HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_XET=1   # 不关 xet 会
 
 ---
 
+## 连接数据库（pgAdmin / DBeaver）
+
+数据库是 Compose 的 `db` 服务：**PostgreSQL 16 + pgvector**，宿主机端口 5432。
+图形化客户端或 `psql` 用下面这组参数（与 `docker-compose.yml` 一致）：
+
+| 字段 | 值 |
+|---|---|
+| Host | `127.0.0.1`（**不要填 `db`**，那是容器内网名） |
+| Port | `5432` |
+| Database / Maintenance database | `tracingqa` |
+| Username | `tracingqa` |
+| Password | `tracingqa` |
+| SSL mode | `Disable`（本地容器未开 SSL） |
+
+命令行等价方式：
+
+```bash
+docker compose exec -T db psql -U tracingqa -d tracingqa
+```
+
+pgAdmin 里几个容易绕弯的地方：
+
+- **没有独立的「切换数据库」按钮**：数据库挂在服务器连接下面。要么在
+  `Register → Server → Connection` 把 `Maintenance database` 填成 `tracingqa`，
+  要么连上后在左侧 `Databases → tracingqa` 上右键 **Query Tool**，查询窗口才会连到该库。
+  在树里单击数据库只是「选中」，不代表查询窗口已切过去。
+- **5432 只能被一个实例占用**：若还留着其他项目的连接（例如用户 `fengshu_app`），
+  会报 `password authentication failed for user ...`；Host 填成 `db` 之类的容器名则报
+  `[Errno 11001] getaddrinfo failed`。按上表改成 `127.0.0.1` + `tracingqa` 即可；
+  要连回别的项目，先 `docker compose down` 释放端口。
+- **一次执行多条 SQL 只看到最后一张表**：Query Tool 的 Data Output 默认只保留最后一个
+  结果集，逐条选中语句后按 F5 才能分别查看。
+
+库里有 5 张表：`users`、`documents`、`chunks`、`qa_logs`、`eval_runs`（结构见 `app/models.py`）。
+首次启动 API 时由 `init_db()` 自动建表、建索引并灌入 3 个 demo 用户，**目前没有 Alembic 迁移**，
+字段变更需要手动同步既有库。数据存在卷 `pgdata` 里，`docker compose down` 不会清空，
+`docker compose down -v` 才会删除全部数据。
+
+---
+
 ## 前端控制台（web/）
 
-Vite + React 19 + TypeScript 单页，**不是完整后台**，只做三件能把后端卖点讲清楚的事：
+Vite + React 19 + TypeScript 单页，**不是完整后台**，只做四件能把后端卖点讲清楚的事：
 
 ```bash
 cd web
 npm install
 npm run dev          # http://127.0.0.1:5173
+npm run build        # tsc -b + vite build，验证类型并产出 dist/
+npm run lint         # oxlint
 ```
+
+> `npm run lint` 目前会报 1 条 `react(set-state-in-effect)` 警告（`App.tsx` 的
+> `useEffect` 里同步 setState），是既有写法，0 error，不影响构建。
 
 前提：后端 API 已在 8000 端口跑着。前端走 `/api` 同源请求，由 vite dev server 代理过去
 （见 `web/vite.config.ts`），所以前端代码里没有任何硬编码端口，部署时换成 nginx 反代即可。
@@ -187,6 +253,10 @@ web/
 | embedder/reranker 反复重启，日志 `Could not download model artifacts` | TEI 下载器要求 `Content-Range`，hf-mirror 重定向丢掉该头 | 已修：宿主机 `hf download` 到 `.models/` 再挂载（见上文）。手动下时报 `cas-server.xethub.hf.co 401` 则加 `HF_HUB_DISABLE_XET=1` |
 | `docker compose up` 报 `dial tcp [2a03:...]` / `no HTTPS proxy` | `docker.io`、`ghcr.io` 在国内 DNS 被污染，直连不通 | 已修：`.env` 里 `DB_IMAGE` / `TEI_IMAGE` 指向 daocloud 镜像站，后台 `daemon.json` 配了 `registry-mirrors` |
 | `pytest` 报 `WinError 5 拒绝访问` | D 盘写 `.pytest_cache` 被拦 | 加 `-p no:cacheprovider` |
+| pgAdmin 报 `password authentication failed for user xxx` / `[Errno 11001] getaddrinfo failed` | 5432 已被本项目容器占用，却沿用了别的项目用户名；或 Host 填了 `db` 这类容器内网名 | 按【连接数据库】一节填 `127.0.0.1` + `tracingqa`；要连别的项目先 `docker compose down` |
+| PowerShell 里 `curl -H ... -d ...` 报参数错误或无输出 | `curl` 是 `Invoke-WebRequest` 的别名，参数与 curl 不兼容 | 显式用 `curl.exe`，或改用 `Invoke-RestMethod` |
+| `documents` 出现同名两行、召回里有重复段落 | `app.ingest.pipeline` 没有去重，命令被重复执行 | `TRUNCATE TABLE chunks, documents;` 后重新灌一次（见上文） |
+| 所有终端命令都报 `db` 连不上 | 方式 B 下 `.env` 的 `db:5432` 是容器内网地址 | 每个新开的 PowerShell 窗口都要重新设 `$env:DATABASE_URL`（方式 A 不需要） |
 
 ---
 
@@ -226,7 +296,7 @@ WHERE d.tenant_id = :tenant_id
 | `app/generation/answer.py` | 带引用结构化输出 + 幻觉引用剔除 |
 | `app/models.py` | 数据模型（注意 `QALog` 是审计表） |
 | `evals/harness.py` | ⭐ 评测主程序 + CI 门禁 |
-| `evals/dataset.yaml` | 100 题黄金集模板 |
+| `evals/dataset.yaml` | 9 道样例用例（常规/拒答/越权/注入四类，`gold_chunk_ids`、`forbidden_chunk_ids` 待回填） |
 | `app/ingest/pipeline.py` | ingestion 管线 |
 | `项目设计.md` | 完整设计书（含里程碑、面试话术） |
 
@@ -241,7 +311,7 @@ WHERE d.tenant_id = :tenant_id
 | `app/embeddings.py` | 哈希向量兜底 | 本地 bge-m3（Xinference / TEI）或 OpenAI embedding |
 | `app/security.py` | 本地 HMAC JWT + 演示用户头 | 真 OIDC（Keycloak / Okta / Entra ID） |
 | `evals/harness.py` 的 `_dummy_embed` | 抛 NotImplementedError | 接入 `embed_texts` |
-| 前端 | 无 | React/Vue 控制台 + 可嵌入 widget |
+| `web/` 前端 | 已有 Vite + React 19 单页控制台（身份切换、引用联动、审计日志） | 登录页、管理后台、可嵌入 widget |
 | `app/api/mcp_server.py` | 未实现 | MCP server（Anthropic JD 直接要求的交付物） |
 
 ---
