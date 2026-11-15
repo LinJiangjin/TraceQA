@@ -1,12 +1,20 @@
+/** 答案面板：展示回答/拒答状态、耗时与置信度，并把引用渲染成可点击上标。 */
 import type { QAResponse } from '../types'
 
 interface Props {
   result: QAResponse
+  /** 当前选中的引用编号，null 表示未选中 */
   activeCitation: number | null
+  /** 点击 [n] 时回传编号，由 App 联动 SourceList 高亮 */
   onCite: (index: number) => void
 }
 
-/** 把 "[1]"、"[2]" 这类引用标记渲染成可点击的上标。 */
+/**
+ * 把 "[1]"、"[2]" 这类引用标记渲染成可点击的上标。
+ *
+ * 用带捕获组的 split 保留分隔符，普通文本原样输出。
+ * 编号不做范围校验：后端已剔除幻觉引用，这里信任 sources 的编号。
+ */
 function renderAnswer(answer: string, onCite: (index: number) => void) {
   return answer.split(/(\[\d+\])/g).map((part, i) => {
     const m = part.match(/^\[(\d+)\]$/)
@@ -20,6 +28,7 @@ function renderAnswer(answer: string, onCite: (index: number) => void) {
   })
 }
 
+/** 拒答时增加 --refused 样式类，并解释「上下文闸门」为什么没有调用 LLM。 */
 export function AnswerView({ result, activeCitation, onCite }: Props) {
   return (
     <section className={`answer ${result.refused ? 'answer--refused' : ''}`}>

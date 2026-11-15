@@ -14,11 +14,18 @@ from app.models import Base
 
 settings = get_settings()
 
+# pool_pre_ping：连接被数据库/网络断开时自动重连，避免长驻进程拿到失效连接。
 engine = create_engine(settings.database_url, future=True, pool_pre_ping=True)
+# autoflush=False：审计写入前不被隐式 flush 打断；每个请求用独立 session，用完即关。
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 
 def get_db():
+    """FastAPI 依赖：yield 一个请求级会话，请求结束后必定关闭。
+
+    用生成器而非 `return`，是为了让 `finally` 在响应发送后执行，
+    即使路由抛异常也不会泄漏连接。
+    """
     db = SessionLocal()
     try:
         yield db
@@ -41,6 +48,7 @@ def init_db() -> None:
 
     Base.metadata.create_all(engine)
 
+    # IF NOT EXISTS 保证重复启动幂等；三个索引分别服务 ACL 过滤、全文检索、向量近邻。
     with engine.begin() as conn:
         conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS idx_documents_acl "

@@ -1,5 +1,6 @@
 /** 与后端 app/api/qa.py、app/main.py 的返回结构一一对应。 */
 
+/** 一条召回/引用段落；index 与答案里的 [n] 编号一致（1-based）。 */
 export interface Source {
   index: number
   chunk_id: string
@@ -9,17 +10,23 @@ export interface Source {
   rerank_score: number
 }
 
+/** POST /api/v1/qa 的响应。 */
 export interface QAResponse {
   question: string
   answer: string
+  /** 答案里实际使用的引用编号列表 */
   citations: number[]
+  /** 引用编号对应的 chunk_id，用于溯源核对 */
   cited_chunk_ids: string[]
+  /** true 表示上下文闸门判定证据不足、未调用 LLM */
   refused: boolean
   confidence: number
+  /** 送进 LLM 上下文的全部段落（含未被引用的） */
   sources: Source[]
   latency_ms: number
 }
 
+/** GET /api/v1/me 的响应：当前演示身份的租户与角色。 */
 export interface MeResponse {
   id: string
   email: string
@@ -29,6 +36,7 @@ export interface MeResponse {
   auth_source: string
 }
 
+/** GET /api/v1/admin/qa-logs 的单条审计记录。 */
 export interface QaLog {
   id: string
   user_id: string
@@ -47,6 +55,7 @@ export interface Identity {
   hint: string
 }
 
+/** 与 app/seed.py 的 DEMO_USERS 保持一致，切换它即可演示权限差异。 */
 export const IDENTITIES: Identity[] = [
   { id: 'u-alice', label: 'Alice · 普通员工', hint: 'roles: employee' },
   { id: 'u-hr', label: 'HR · 人力资源', hint: 'roles: employee, hr' },

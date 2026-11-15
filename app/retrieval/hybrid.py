@@ -5,7 +5,7 @@
 1. 为什么 ACL 必须在 SQL 层过滤，而不是检索完再在 Python 里筛？
    - 若先取 top-k 再过滤，无权限的高相似段落会占据名额，过滤后剩下的可能是垃圾，
      答案质量直接崩塌；
-   - 更严重的是"留 embarrassment 泄漏"风险：某些实现会把它留在 LLM 上下文里；
+   - 更严重的是信息泄漏风险：某些实现会把它留在 LLM 上下文里；
    - 因此 tenant_id + ACL 一律下推到 WHERE，`d.acl && :roles` 走 GIN 索引。
 
 2. 为什么中文用 bigram 而不是装 zhparser？
@@ -13,6 +13,10 @@
    - 客户环境（内网、受限镜像）往往装不了第三方扩展；
    - bigram 是"在约束下能落地"的工程取舍，召回够用，代价是索引体积翻倍。
    - 所以 query 侧与入库侧必须用同一个 `to_search_text()`，否则检索失效。
+
+3. 为什么用 RRF 融合而不是分数加权？
+   - BM25 分数与余弦相似度不同量纲、不可比；
+   - RRF 只依赖各路内部的排名 `1 / (rrf_k + rank)`，无需归一化即可稳定融合。
 """
 
 from __future__ import annotations
@@ -36,6 +40,7 @@ def to_search_text(content: str) -> str:
     """入库侧与查询侧共用的文本预处理。
 
     英文/数字按词切，中文按 bigram 切。例如 "年假怎么请" -> "年假 假怎 怎么 么请"。
+    返回值同时写入 chunks.search_text，并由数据库生成列转成 tsvector。
     """
     buf: list[str] = []
     for token in _TOKEN.findall(content):
@@ -51,6 +56,12 @@ def to_search_text(content: str) -> str:
 
 @dataclass
 class Retrieved:
+    """一条候选段落及其三路分数。
+
+    scores 含 rrf（融合分）、bm25（词面）、cosine（语义），
+    后续 rerank 降级时会用 rrf 兜底，前端只展示 rerank_score。
+    """
+
     chunk_id: int
     document_id: int
     content: str
@@ -61,6 +72,8 @@ class Retrieved:
 
 # 两路召回各自取 retrieve_k，然后加权融合。
 # 注意：ACL 过滤同时出现在两个 CTE 里，任何一路漏了都会造成越权泄漏。
+# CTE 顺序：visible（统一权限过滤）-> lex / sem（各自取 top-k 并编号）
+#          -> pooled（合并两路）-> 按 id 聚合算 RRF，取前 limit_n 条。
 _HYBRID_SQL = text(
     """
 WITH visible AS (
@@ -88,6 +101,7 @@ lex AS (
 sem_raw AS (
     -- 注意：这里不能再 JOIN chunks。visible 已经含 chunks 的列，
     -- 再 join 一次会让 `id` 变成 ambiguous column reference。
+    -- <=> 是 pgvector 的余弦距离，1 - 距离即余弦相似度。
     SELECT id, content, document_id, title, source_uri,
            1 - (embedding <=> CAST(:vec AS vector)) AS sc
     FROM visible
@@ -126,7 +140,18 @@ def hybrid_retrieve(
     k: int | None = None,
     limit_n: int | None = None,
 ) -> list[Retrieved]:
-    """返回按 RRF 融合排序的候选段落。ACL 已在此处完成过滤。"""
+    """返回按 RRF 融合排序的候选段落。ACL 已在此处完成过滤。
+
+    Args:
+        tenant_id / roles: 权限边界，直接下推到 SQL 的 WHERE。
+        question: 原始问题，用 `to_search_text()` 转成词面查询串。
+        query_vector: 问题的嵌入向量，用于向量近邻召回。
+        k: 每路召回条数，默认 settings.retrieve_k。
+        limit_n: 融合后交给 rerank 的条数，默认 settings.rerank_input_k。
+
+    Returns:
+        按 rrf 降序排列的 `Retrieved` 列表；无可见文档时返回空列表。
+    """
     rows = db.execute(
         _HYBRID_SQL,
         {

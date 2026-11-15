@@ -1,14 +1,17 @@
+/** 审计日志表格：展示后端 qa_logs 里最近的问答，用于演示「可复盘」。 */
 import type { QaLog } from '../types'
 
 interface Props {
   logs: QaLog[]
 }
 
+/** 把 ISO 时间格式化成本地时间字符串；后端未给时间时显示占位符。 */
 function time(iso: string | null) {
   if (!iso) return '—'
   return new Date(iso).toLocaleTimeString('zh-CN', { hour12: false })
 }
 
+/** 无日志时整个区块不渲染，避免页面出现空表格。 */
 export function AuditLog({ logs }: Props) {
   if (logs.length === 0) return null
 
@@ -26,6 +29,7 @@ export function AuditLog({ logs }: Props) {
           </tr>
         </thead>
         <tbody>
+          {/* 以日志 id 作为 key，避免时间相同导致的复用错乱。 */}
           {logs.map((l) => (
             <tr key={l.id}>
               <td>{time(l.created_at)}</td>

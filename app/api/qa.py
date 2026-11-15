@@ -22,6 +22,15 @@ settings = get_settings()
 
 @dataclass
 class QARequest:
+    """POST /api/v1/qa 的请求体。
+
+    Attributes:
+        question: 用户问题。
+        top_n: 可选，覆盖最终进 LLM 上下文的段落数，供评测扫参数用。
+
+    注意：这里刻意不含 tenant_id / roles，身份只由服务端解析，防止客户端伪造。
+    """
+
     question: str
     top_n: int | None = None
 
@@ -36,6 +45,26 @@ def run_qa(
     embed_text=None,
     top_n: int | None = None,
 ) -> dict:
+    """执行一次完整问答：嵌入 → 混合检索 → 精排 → 充分性闸门 → 生成/拒答 → 审计。
+
+    Args:
+        db: SQLAlchemy 会话，用于检索、读写审计日志。
+        tenant_id: 租户 ID，参与检索层的第一道隔离。
+        roles: 用户角色标签列表，与文档的 acl 数组做交集匹配。
+        question: 用户问题原文。
+        user_id: 提问者 ID，写入审计表；评测调用时可为 None。
+        embed_text: 单条文本的嵌入函数（接收 str，返回 list[float]）。
+            以参数注入是为了让 evals 能替换实现，也避免本模块依赖具体模型服务。
+        top_n: 覆盖 settings.top_n，用于评测时做参数扫点。
+
+    Returns:
+        字典，字段与 `web/src/types.ts` 的 QAResponse 一一对应：
+        question / answer / citations / cited_chunk_ids / refused /
+        confidence / sources / latency_ms。
+
+    Side Effects:
+        无论回答还是拒答，都会向 qa_logs 写入一条记录并提交事务。
+    """
     started = time.perf_counter()
 
     # ① 嵌入查询
@@ -60,6 +89,7 @@ def run_qa(
         cited_chunk_ids: list[str] = []
     else:
         payload = generate_answer(question, ranked)
+        # 引用编号是 1-based，映射回 ranked 里对应的 chunk_id 供前端定位原文。
         cited_chunk_ids = [ranked[i - 1].retrieved.chunk_id for i in payload.get("citations", [])]
 
     latency_ms = int((time.perf_counter() - started) * 1000)

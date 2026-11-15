@@ -2,6 +2,10 @@
 
 切分策略是 evals 里第一个要优化的变量。默认 256/64 是经过大量实践验证的起点，
 但不要盲信 —— 用 evals/harness.py 跑出你自己的数据上的最优值，再把结论写进 case study。
+
+用法：
+    python -m app.ingest.pipeline --input sample_docs/employee --tenant acme --acl employee
+    python -m app.ingest.pipeline --input sample_docs/hr --tenant acme --acl employee,hr
 """
 
 from __future__ import annotations
@@ -24,6 +28,19 @@ _SENT_SPLIT = "。！？；\n"
 
 
 def split_text(content: str, size: int = 256, overlap: int = 64) -> list[str]:
+    """按字符窗口切分，尽量在句末标点断开，并在相邻块间保留重叠。
+
+    Args:
+        content: 已清洗的正文。
+        size: 每块最大字符数。
+        overlap: 相邻块重叠字符数，降低边界信息丢失。
+
+    Returns:
+        非空段落列表；正文为空时返回 []。
+
+    注意：只有断点落在窗口后半段（> size*0.5）才采用，
+    否则切出的块会过短，导致向量与索引里充斥碎片。
+    """
     if len(content) <= size:
         return [content] if content.strip() else []
 
@@ -56,12 +73,23 @@ def ingest_file(
     size: int = 256,
     overlap: int = 64,
 ) -> int:
+    """灌入单个文件：解析、切分、批量嵌入，然后写 documents + chunks 两张表。
+
+    Args:
+        tenant_id: 文档所属租户。
+        acl: 允许访问的角色标签列表，作为文档级权限写入 documents.acl。
+        size / overlap: 透传给 `split_text()`。
+
+    Returns:
+        写入的段落数；文件无可索引内容时返回 0。
+    """
     doc = load_any(path)
     chunks = split_text(doc.content, size=size, overlap=overlap)
     if not chunks:
         print(f"[skip] {path.name}：无可索引内容")
         return 0
 
+    # 一次请求算完所有段落的向量，避免逐段调用模型服务带来的高延迟。
     vectors = embed_texts(chunks)
     document_id = new_id()
 
@@ -84,6 +112,8 @@ def ingest_file(
             },
         )
 
+        # search_text 必须与查询侧共用 to_search_text()，否则 BM25 一路召回失效；
+        # embedding 先转成 pgvector 字面量，SQL 里再 CAST 成 vector 类型。
         rows = [
             {
                 "id": new_id(),
@@ -96,6 +126,7 @@ def ingest_file(
             }
             for i, (c, v) in enumerate(zip(chunks, vectors, strict=False))
         ]
+        # executemany：一次提交所有段落，比逐条 INSERT 快一个量级。
         db.execute(
             text(
                 "INSERT INTO chunks (id, document_id, content, chunk_index, token_count, embedding, search_text) "
@@ -111,6 +142,11 @@ def ingest_file(
 
 
 def main() -> None:
+    """CLI 入口：递归扫描目录，把支持的文档逐个灌入同一个 tenant/ACL 下。
+
+    --acl 用逗号分隔多个角色；不同权限的文档要分多次执行，
+    例如 sample_docs/hr 单独用 `--acl employee,hr` 灌入。
+    """
     p = argparse.ArgumentParser()
     p.add_argument("--input", required=True, help="文档目录")
     p.add_argument("--tenant", default="acme")

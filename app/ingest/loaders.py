@@ -15,18 +15,32 @@ from pathlib import Path
 
 @dataclass
 class RawDocument:
+    """解析后的统一中间结构，与具体文件格式解耦。
+
+    Attributes:
+        title: 展示用标题，会进入 sources[].title。
+        content: 纯文本正文，交给 `split_text()` 切段。
+        source_uri: 来源路径，用于前端展示与人工核对。
+        metadata: 解析器附加信息（类型、页数、needs_ocr 等），写入 documents.doc_metadata。
+    """
+
     title: str
     content: str
     source_uri: str
     metadata: dict
 
 
+# 三个正则分别负责：去 HTML 标签、压缩水平空白（含全角空格）、收敛连续空行。
 _TAG = re.compile(r"<[^>]+>")
 _WS = re.compile(r"[ \t　]+")
 _NL = re.compile(r"\n{3,}")
 
 
 def _clean(text: str) -> str:
+    """统一换行、压缩空白、去掉首尾空白，保证切分结果稳定。
+
+    只做无害的格式归一，不做内容改写 —— 引用必须能还原成原文。
+    """
     text = text.replace("\r\n", "\n").replace("\u00a0", " ")
     text = _WS.sub(" ", text)
     text = _NL.sub("\n\n", text)
@@ -34,12 +48,14 @@ def _clean(text: str) -> str:
 
 
 def load_markdown(path: Path) -> RawDocument:
+    """读取 Markdown：取首个标题行作为标题，正文保留 Markdown 原文。"""
     content = path.read_text(encoding="utf-8", errors="ignore")
     title = content.lstrip("# ").split("\n", 1)[0][:200] or path.stem
     return RawDocument(title=title, content=_clean(content), source_uri=str(path), metadata={"type": "markdown"})
 
 
 def load_html(path: Path) -> RawDocument:
+    """读取 HTML：先去掉 script/style 块，再剥标签并反转义实体。"""
     raw = path.read_text(encoding="utf-8", errors="ignore")
     body = re.sub(r"(?is)<(script|style).*?</\1>", " ", raw)
     title_match = re.search(r"(?is)<title>(.*?)</title>", body)
@@ -49,6 +65,11 @@ def load_html(path: Path) -> RawDocument:
 
 
 def load_pdf(path: Path) -> RawDocument:
+    """用 pypdf 逐页抽取文本，并标记疑似扫描件。
+
+    单页文本少于 20 字符视为疑似扫描页；超过半数时打上 `needs_ocr`，
+    交由后续 OCR 流程处理，而不是把空内容直接灌进向量库。
+    """
     try:
         from pypdf import PdfReader
     except ImportError as exc:  # pragma: no cover
@@ -71,10 +92,12 @@ def load_pdf(path: Path) -> RawDocument:
     return RawDocument(title=path.stem, content=content, source_uri=str(path), metadata=metadata)
 
 
+# 后缀 -> 解析函数映射；未命中的后缀由 load_any() 当纯文本处理。
 LOADERS = {".md": load_markdown, ".markdown": load_markdown, ".html": load_html, ".htm": load_html, ".pdf": load_pdf}
 
 
 def load_any(path: Path) -> RawDocument:
+    """按扩展名分派解析器；未知类型（如 .txt）退化为纯文本读取。"""
     loader = LOADERS.get(path.suffix.lower())
     if loader is None:
         return RawDocument(

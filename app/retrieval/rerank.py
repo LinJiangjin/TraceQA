@@ -1,4 +1,4 @@
-"""重排 + 拓扑-regulated 拒答。
+"""重排 + 基于分数阈值的拒答。
 
 为什么要 rerank：
     双路召回为了保证 Recall 会取很宽（默认各 50），但 LLM 上下文只能放 5 段。
@@ -24,6 +24,14 @@ settings = get_settings()
 
 @dataclass
 class Ranked:
+    """精排后的段落。
+
+    Attributes:
+        retrieved: 原始候选段落。
+        rerank_score: cross-encoder 分数；降级时为 RRF 融合分。
+        degraded: 是否未真正精排，拒答闸门会据此跳过分数判断。
+    """
+
     retrieved: Retrieved
     rerank_score: float
     # True 表示这一轮没真正跑 cross-encoder（服务不可用或候选数不足），
@@ -37,6 +45,9 @@ def _post_rerank(question: str, candidates: list[Retrieved]) -> list[tuple[int, 
     TEI 一个实例只加载一个模型，所以 reranker 必须单独起一个服务，
     端口与 embedder 分开（见 docker-compose.yml 的 reranker 服务）。
     响应兼容两种格式：TEI 直接返回数组，OpenAI/Xinference 风格返回 {"data": [...]}。
+
+    Returns:
+        按分数降序的 (候选下标, 分数) 列表；响应无有效结果时返回 None。
     """
     payload = json.dumps(
         {
@@ -57,6 +68,7 @@ def _post_rerank(question: str, candidates: list[Retrieved]) -> list[tuple[int, 
         data = json.load(resp)
 
     items = data if isinstance(data, list) else data.get("data", [])
+    # index 是服务回传的候选下标，用不存在的字段表示响应格式不符，宁可降级也不要错位引用。
     scored = [(int(item["index"]), float(item["score"])) for item in items if "index" in item]
     if not scored:
         return None
@@ -65,6 +77,22 @@ def _post_rerank(question: str, candidates: list[Retrieved]) -> list[tuple[int, 
 
 
 def rerank(question: str, candidates: list[Retrieved], top_n: int | None = None) -> list[Ranked]:
+    """把融合召回的候选精排并截断到 top_n 条。
+
+    三种不真正精排的情况都会标记 degraded：
+    1. 配置关闭了 rerank；
+    2. 候选数本来就不多于 top_n（没必要再排）；
+    3. 远端 reranker 不可用且 `rerank_fail_open=True`。
+
+    Args:
+        question: 用户问题，与候选正文一起送进 cross-encoder。
+        candidates: `hybrid_retrieve()` 的返回，已按 RRF 降序。
+        top_n: 覆盖 settings.top_n。
+
+    Returns:
+        `Ranked` 列表；`rerank_fail_open=False` 且服务不可用时返回空列表，
+        由上层闸门走拒答分支。
+    """
     if not candidates:
         return []
     top_n = top_n or settings.top_n
@@ -96,6 +124,13 @@ def is_context_sufficient(ranked: list[Ranked], min_score: float | None = None) 
     注意：只有真正跑过 cross-encoder 的分数才过这道闸门。
     degraded（reranker 没起来）时用融合分判断会把所有问题都判成"不充分"，
     等于把整个系统变成只会拒答，比答错更难排查。
+
+    Args:
+        ranked: 精排结果，按分数降序。
+        min_score: 覆盖 settings.rerank_min_score，供评测扫阈值。
+
+    Returns:
+        True 表示可以交给 LLM 生成；False 表示应当拒答。
     """
     if not ranked:
         return False

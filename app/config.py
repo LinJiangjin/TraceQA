@@ -1,10 +1,21 @@
+"""全局配置：所有可调项都通过环境变量或 .env 注入。
+
+模块被导入时即实例化一次 `Settings`（见各模块的 `settings = get_settings()`），
+因此修改环境变量后需要重启进程才会生效。
+"""
+
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """全部配置环境变量化。私有化交付时客户只需要改 .env，不用碰代码。"""
+    """全部配置环境变量化。私有化交付时客户只需要改 .env，不用碰代码。
+
+    字段按用途分组：服务 / 演示数据 / 数据库 / 嵌入 / 重排 / LLM /
+    检索 / 安全 / 观测。字段名大小写不敏感，例如 `DATABASE_URL` 对应
+    `database_url`；`model_config` 里的 `extra="ignore"` 表示忽略未知变量。
+    """
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -69,4 +80,9 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
+    """返回全局单例配置。
+
+    用 `lru_cache` 缓存，避免每个模块重复解析 .env、重复构造 Settings 对象。
+    单测里若要覆盖配置，需先调用 `get_settings.cache_clear()`。
+    """
     return Settings()

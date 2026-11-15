@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.models import User
 
+# 与 sample_docs/ 下的 ACL 标签配套：employee 为公开制度，hr 为薪酬机密。
 DEMO_USERS = [
     {
         "id": "u-alice",
@@ -40,7 +41,11 @@ DEMO_USERS = [
 
 
 def seed_demo_users(db: Session) -> int:
-    """幂等：已存在（按 id 或 email）就跳过，返回新插入条数。"""
+    """幂等：已存在（按 id 或 email）就跳过，返回新插入条数。
+
+    两个集合都查一次，是为了避免 id 相同但 email 被占用（或反过来）时
+    触发唯一约束报错；幂等性让 `init_db()` 可以在每次重启时安全调用。
+    """
     existing = {
         row[0]
         for row in db.query(User.id).filter(User.id.in_([u["id"] for u in DEMO_USERS])).all()
@@ -59,6 +64,7 @@ def seed_demo_users(db: Session) -> int:
         db.add(User(**u))
         added += 1
 
+    # 一次性提交，减少启动时的往返；没有新增就不写库。
     if added:
         db.commit()
         print(f"[seed] 写入 {added} 个演示用户：" + "、".join(u["id"] for u in DEMO_USERS))
@@ -66,6 +72,7 @@ def seed_demo_users(db: Session) -> int:
 
 
 if __name__ == "__main__":
+    # 允许单独执行 `python -m app.seed` 手动补数据。
     from app.db import SessionLocal
 
     with SessionLocal() as db:
